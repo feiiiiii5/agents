@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from typing import Any
 
 import pytest
 
 from livekit.agents import Agent, AgentSession, AgentTask, RunContext, function_tool
-from livekit.agents.llm import FunctionToolCall
+from livekit.agents.llm import ChatChunk, ChoiceDelta, FunctionToolCall, LLMStream
 from livekit.agents.llm.async_toolset import AsyncToolset
-from livekit.agents.voice.events import SpeechCreatedEvent
+from livekit.agents.types import DEFAULT_API_CONNECT_OPTIONS
+from livekit.agents.voice.events import ConversationItemAddedEvent, SpeechCreatedEvent
 
 from .fake_llm import FakeLLM, FakeLLMResponse
 
@@ -229,3 +231,87 @@ async def test_session_scoped_reply_is_dropped_on_close() -> None:
     assert not toolset._executor._reply_task.done()
 
     await asyncio.wait_for(sess.aclose(), timeout=5.0)
+
+
+class _OwedReplyStream(LLMStream):
+    def __init__(
+        self,
+        llm: FakeLLM,
+        *,
+        chat_ctx: Any,
+        tools: Any,
+        conn_options: Any,
+    ) -> None:
+        super().__init__(llm, chat_ctx=chat_ctx, tools=tools, conn_options=conn_options)
+
+    async def _run(self) -> None:
+        await asyncio.sleep(0.1)
+        self._event_ch.send_nowait(
+            ChatChunk(
+                id="owed_reply",
+                delta=ChoiceDelta(role="assistant", content="It is sunny."),
+            )
+        )
+
+
+class _OwedReplyLLM(FakeLLM):
+    """FakeLLM that can answer the executor's instruction-only deferred reply."""
+
+    def chat(
+        self,
+        *,
+        chat_ctx: Any,
+        tools: Any = None,
+        conn_options: Any = DEFAULT_API_CONNECT_OPTIONS,
+        **kwargs: Any,
+    ) -> LLMStream:
+        if any(
+            item.type == "function_call_output" and item.output == "link sent"
+            for item in chat_ctx.items
+        ):
+            return _OwedReplyStream(
+                self, chat_ctx=chat_ctx, tools=tools or [], conn_options=conn_options
+            )
+        return super().chat(chat_ctx=chat_ctx, tools=tools, conn_options=conn_options, **kwargs)
+
+
+async def test_owed_deferred_reply_keeps_agent_thinking() -> None:
+    """A speech ending while a deferred tool reply is owed must not reach listening.
+
+    The deferred reply cannot start until the agent is idle; if the speech-end state
+    ignores the pending update, clients see a listening edge before the tool answer.
+    """
+    calls = [FunctionToolCall(name="send_link", arguments="{}", call_id="call_send_link")]
+    llm = _OwedReplyLLM(
+        fake_responses=[
+            FakeLLMResponse(
+                input="go", content="one moment", ttft=0.1, duration=0.1, tool_calls=calls
+            ),
+            # the busy reply outlasts the tool, so the tool reply stays queued
+            FakeLLMResponse(input="busy", content="still going", ttft=0.1, duration=1.0),
+            FakeLLMResponse(input="link sent", content="It is sunny.", ttft=0.1, duration=0.1),
+        ]
+    )
+    agent = _First(with_send_link=True)
+    async with AgentSession(llm=llm) as sess:
+        states: list[str] = []
+        answered = asyncio.Event()
+
+        sess.on("agent_state_changed", lambda ev: states.append(ev.new_state))
+
+        def _on_item(ev: ConversationItemAddedEvent) -> None:
+            if getattr(ev.item, "text_content", None) == "It is sunny.":
+                answered.set()
+
+        sess.on("conversation_item_added", _on_item)
+        await sess.start(agent)
+        await sess.run(user_input="go")
+        sess.generate_reply(user_input="busy")
+        await asyncio.wait_for(answered.wait(), timeout=10.0)
+        await asyncio.sleep(0.2)
+
+        assert sess.agent_state == "listening"
+        speaking = [i for i, state in enumerate(states) if state == "speaking"]
+        assert len(speaking) >= 3, states
+        between = states[speaking[-2] + 1 : speaking[-1]]
+        assert "listening" not in between, states

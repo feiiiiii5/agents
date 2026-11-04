@@ -319,6 +319,11 @@ class _ToolExecutor:
         return bool(self._running_tasks)
 
     @property
+    def has_pending_reply(self) -> bool:
+        """Whether a deferred tool reply is owed but has not started yet."""
+        return bool(self._pending_updates)
+
+    @property
     def has_cancellable_running_tasks(self) -> bool:
         return any(t.allow_cancellation for t in self._running_tasks.values())
 
